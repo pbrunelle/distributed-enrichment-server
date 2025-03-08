@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import heapq
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response, status
 from pydantic import BaseModel
 import logging
 
@@ -162,7 +162,19 @@ async def startup_event():
     background_thread.start()
     logger.info("Started story generator background task")
 
-@app.get("/v1/enrichment", response_model=Optional[Enrichment])
+@app.get(
+    "/v1/enrichment",
+    response_model=Enrichment,
+    responses={
+        status.HTTP_200_OK: {
+            "model": Enrichment,  # Redundant here, but good practice for clarity, or if you want to customize 200 docs
+            "description": "Enrichment was available",
+        },
+        status.HTTP_204_NO_CONTENT: {
+            "description": "No enrichment available"
+        },
+    },
+)
 async def get_enrichment():
     """Get the next available enrichment, if any."""
     with data_lock:
@@ -171,7 +183,7 @@ async def get_enrichment():
         # Check if we have any available enrichments
         if not enrichments_queue or enrichments_queue[0][0] > current_time:
             # No enrichments available yet
-            return None
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
 
         # Get the earliest available enrichment
         _, _, enrichment = heapq.heappop(enrichments_queue)
