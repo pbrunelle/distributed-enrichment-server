@@ -51,6 +51,14 @@ class Aggregation(BaseModel):
 enrichments_queue = []  # Will be used as a heap
 sent_enrichments = defaultdict(dict)  # story_id -> {enricher_name: enrichment}
 valid_story_ids = set()
+n_generated_stories = 0
+n_generated_enrichments = 0
+n_get_enrichment_200 = 0
+n_get_enrichment_204 = 0
+n_aggregation_200 = 0
+n_aggregation_400_story_id = 0
+n_aggregation_400_enrichers = 0
+n_aggregation_400_enrichments = 0
 
 # Lock for thread safety
 data_lock = threading.Lock()
@@ -113,6 +121,7 @@ def generate_enrichment(enricher_name: str, story_id: str) -> Dict:
 
 def generate_story_enrichments(story_id: str):
     """Generate enrichments for a specific story."""
+    global n_generated_enrichments
     selected_enrichers = ENRICHERS[:]
     random.shuffle(selected_enrichers)
 
@@ -138,15 +147,18 @@ def generate_story_enrichments(story_id: str):
             # We also add a unique ID as second element to avoid comparison of dicts
             # when timestamps are equal
             heapq.heappush(enrichments_queue, (available_at, id(enrichment), enrichment))
+            n_generated_enrichments += 1
             logger.debug(f"Scheduled enrichment {enricher_name} for story {story_id}, available in {process_time:.2f}s")
 
 def story_generator():
     """Background task that generates stories."""
+    global n_generated_stories
     while True:
         # Generate a new story
         story_id = generate_story_id()
         with data_lock:
             valid_story_ids.add(story_id)
+        n_generated_stories += 1
         logger.info(f"Generated new story: {story_id}")
 
         # Generate enrichments for this story - these will be interleaved with other stories
@@ -177,12 +189,16 @@ async def startup_event():
 )
 async def get_enrichment():
     """Get the next available enrichment, if any."""
+    global n_get_enrichment_200
+    global n_get_enrichment_204
+
     with data_lock:
         current_time = time.time()
 
         # Check if we have any available enrichments
         if not enrichments_queue or enrichments_queue[0][0] > current_time:
             # No enrichments available yet
+            n_get_enrichment_204 += 1
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
         # Get the earliest available enrichment
@@ -195,9 +211,8 @@ async def get_enrichment():
 
         sent_enrichments[story_id][enricher_name] = enrichment_data
 
+        n_get_enrichment_200 += 1
         logger.info(f"Serving enrichment: {enricher_name} for story {story_id}")
-
-        # Return the enrichment
         return Enrichment(
             story_id=story_id,
             enricher_name=enricher_name,
@@ -207,11 +222,16 @@ async def get_enrichment():
 @app.post("/v1/aggregation")
 async def post_aggregation(aggregation: Aggregation):
     """Receive and validate an aggregation."""
+    global n_aggregation_200
+    global n_aggregation_400_story_id
+    global n_aggregation_400_enrichers
+    global n_aggregation_400_enrichments
     with data_lock:
         story_id = aggregation.story_id
 
         # Check if story ID is valid
         if story_id not in valid_story_ids:
+            n_aggregation_400_story_id += 1
             logger.warning(f"Invalid story ID: {story_id}")
             raise HTTPException(status_code=400, detail=f"Invalid story ID: {story_id}")
 
@@ -219,6 +239,7 @@ async def post_aggregation(aggregation: Aggregation):
         for enricher_name, enrichment_data in aggregation.enrichments.items():
             # Check if this enricher was used for this story
             if enricher_name not in sent_enrichments.get(story_id, {}):
+                n_aggregation_400_enrichers += 1
                 logger.warning(f"Story {story_id} was not processed by enricher {enricher_name}")
                 raise HTTPException(
                     status_code=400,
@@ -228,12 +249,14 @@ async def post_aggregation(aggregation: Aggregation):
             # Check if the enrichment data matches what was sent
             sent_enrichment = sent_enrichments.get(story_id, {}).get(enricher_name)
             if sent_enrichment != enrichment_data:
+                n_aggregation_400_enrichments += 1
                 logger.warning(f"Enrichment data mismatch for story {story_id}, enricher {enricher_name}")
                 raise HTTPException(
                     status_code=400,
                     detail=f"Enrichment data mismatch for story {story_id}, enricher {enricher_name}"
                 )
 
+        n_aggregation_200 += 1
         logger.info(f"Valid aggregation received for story {story_id} with {len(aggregation.enrichments)} enrichments")
         return {"status": "success", "message": "Aggregation accepted"}
 
@@ -247,8 +270,24 @@ async def root():
             "POST /v1/aggregation": "Submit an aggregation"
         },
         "status": {
-            "stories_generated": len(valid_story_ids),
-            "pending_enrichments": len(enrichments_queue)
+            "stories": {
+                "generated": n_generated_stories,
+                "valid": len(valid_story_ids),
+            },
+            "enrichments": {
+                "generated": n_generated_enrichments,
+                "pending": len(enrichments_queue),
+            },
+            "get_enrichment": {
+                "200": n_get_enrichment_200,
+                "204": n_get_enrichment_204,
+            },
+            "post_aggregation": {
+                "200": n_aggregation_200,
+                "400_story_id": n_aggregation_400_story_id,
+                "400_enrichers": n_aggregation_400_enrichers,
+                "400_enrichments": n_aggregation_400_enrichments,
+            }
         }
     }
 
