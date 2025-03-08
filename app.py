@@ -3,7 +3,7 @@ import string
 import time
 import threading
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict
 import heapq
 
 import uvicorn
@@ -40,11 +40,11 @@ ENRICHERS = [
 class Enrichment(BaseModel):
     story_id: str
     enricher_name: str
-    enrichment: Dict
+    enrichment: Any
 
 class Aggregation(BaseModel):
     story_id: str
-    enrichments: List[Tuple[str, Dict]]
+    enrichments: Dict[str, Any]
 
 # In-memory storage
 # Using a priority queue (heap) to ensure we get the next available enrichment by time
@@ -216,7 +216,7 @@ async def post_aggregation(aggregation: Aggregation):
             raise HTTPException(status_code=400, detail=f"Invalid story ID: {story_id}")
 
         # Check if all enrichments were actually sent for this story
-        for enricher_name, enrichment_data in aggregation.enrichments:
+        for enricher_name, enrichment_data in aggregation.enrichments.items():
             # Check if this enricher was used for this story
             if enricher_name not in sent_enrichments.get(story_id, {}):
                 logger.warning(f"Story {story_id} was not processed by enricher {enricher_name}")
