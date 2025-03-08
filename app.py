@@ -1,19 +1,18 @@
 import random
 import string
 import time
-import uuid
+import threading
 from collections import defaultdict
-from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Tuple
+import heapq
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import threading
 import logging
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, 
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -23,7 +22,7 @@ app = FastAPI(title="Enrichment API Simulator")
 STORY_GENERATION_INTERVAL_MS = 1000  # milliseconds
 NUMBER_OF_ENRICHERS = 5
 ENRICHER_TIME_MIN = 0.5  # seconds
-ENRICHER_TIME_MAX = 2.0  # seconds
+ENRICHER_TIME_MAX = 5.0  # seconds
 
 # Enrichers
 ENRICHERS = [
@@ -48,8 +47,9 @@ class Aggregation(BaseModel):
     enrichments: List[Tuple[str, Dict]]
 
 # In-memory storage
-enrichments_queue = []
-sent_enrichments = {}  # story_id -> {enricher_name: enrichment}
+# Using a priority queue (heap) to ensure we get the next available enrichment by time
+enrichments_queue = []  # Will be used as a heap
+sent_enrichments = defaultdict(dict)  # story_id -> {enricher_name: enrichment}
 valid_story_ids = set()
 
 # Lock for thread safety
@@ -64,7 +64,7 @@ def generate_enrichment(enricher_name: str, story_id: str) -> Dict:
     """Generate a fake enrichment for the specified enricher."""
     if enricher_name == "topic_classification":
         return {
-            "topics": random.sample(["politics", "finance", "technology", "sports", "entertainment"], 
+            "topics": random.sample(["politics", "finance", "technology", "sports", "entertainment"],
                                     k=random.randint(1, 3)),
             "confidence": round(random.uniform(0.7, 0.99), 2)
         }
@@ -82,7 +82,7 @@ def generate_enrichment(enricher_name: str, story_id: str) -> Dict:
         }
     elif enricher_name == "keyword_extraction":
         return {
-            "keywords": random.sample(["market", "stocks", "growth", "innovation", "product"], 
+            "keywords": random.sample(["market", "stocks", "growth", "innovation", "product"],
                                       k=random.randint(2, 5))
         }
     elif enricher_name == "summarization":
@@ -111,41 +111,47 @@ def generate_enrichment(enricher_name: str, story_id: str) -> Dict:
     else:
         return {"result": f"Generic enrichment for {enricher_name}"}
 
+def generate_story_enrichments(story_id: str):
+    """Generate enrichments for a specific story."""
+    selected_enrichers = ENRICHERS[:]
+    random.shuffle(selected_enrichers)
+
+    # Schedule each enrichment independently
+    with data_lock:
+        for enricher_name in selected_enrichers:
+            # Each enricher takes a random time between MIN and MAX
+            process_time = random.uniform(ENRICHER_TIME_MIN, ENRICHER_TIME_MAX)
+            available_at = time.time() + process_time
+
+            # Create enrichment data
+            enrichment_data = generate_enrichment(enricher_name, story_id)
+
+            # Create the enrichment object
+            enrichment = {
+                "story_id": story_id,
+                "enricher_name": enricher_name,
+                "enrichment": enrichment_data,
+                "available_at": available_at
+            }
+
+            # Add to queue as a tuple (time, enrichment) for the heap
+            # We also add a unique ID as second element to avoid comparison of dicts
+            # when timestamps are equal
+            heapq.heappush(enrichments_queue, (available_at, id(enrichment), enrichment))
+            logger.debug(f"Scheduled enrichment {enricher_name} for story {story_id}, available in {process_time:.2f}s")
+
 def story_generator():
-    """Background task that generates stories and their enrichments."""
+    """Background task that generates stories."""
     while True:
+        # Generate a new story
+        story_id = generate_story_id()
         with data_lock:
-            story_id = generate_story_id()
             valid_story_ids.add(story_id)
-            logger.info(f"Generated new story: {story_id}")
-            
-            # Select enrichers for this story
-            selected_enrichers = random.sample(ENRICHERS, NUMBER_OF_ENRICHERS)
-            
-            # Initialize story in sent_enrichments
-            if story_id not in sent_enrichments:
-                sent_enrichments[story_id] = {}
-            
-            # Schedule each enrichment
-            for enricher_name in selected_enrichers:
-                # Simulate processing time
-                process_time = random.uniform(ENRICHER_TIME_MIN, ENRICHER_TIME_MAX)
-                
-                # Create enrichment
-                enrichment_data = generate_enrichment(enricher_name, story_id)
-                
-                # Schedule when this enrichment will be available
-                enrichment = {
-                    "story_id": story_id,
-                    "enricher_name": enricher_name,
-                    "enrichment": enrichment_data,
-                    "available_at": time.time() + process_time
-                }
-                
-                # Add to queue
-                enrichments_queue.append(enrichment)
-                logger.debug(f"Scheduled enrichment {enricher_name} for story {story_id}, available in {process_time:.2f}s")
-        
+        logger.info(f"Generated new story: {story_id}")
+
+        # Generate enrichments for this story - these will be interleaved with other stories
+        generate_story_enrichments(story_id)
+
         # Wait for next story generation
         time.sleep(STORY_GENERATION_INTERVAL_MS / 1000)
 
@@ -161,32 +167,24 @@ async def get_enrichment():
     """Get the next available enrichment, if any."""
     with data_lock:
         current_time = time.time()
-        available_enrichments = []
-        
-        # Find available enrichments
-        for i, enrichment in enumerate(enrichments_queue):
-            if enrichment["available_at"] <= current_time:
-                available_enrichments.append((i, enrichment))
-        
-        if not available_enrichments:
+
+        # Check if we have any available enrichments
+        if not enrichments_queue or enrichments_queue[0][0] > current_time:
             # No enrichments available yet
             return None
-        
-        # Take the first available enrichment
-        index, enrichment = available_enrichments[0]
-        
-        # Remove from queue
-        del enrichments_queue[index]
-        
+
+        # Get the earliest available enrichment
+        _, _, enrichment = heapq.heappop(enrichments_queue)
+
         # Store in sent_enrichments for validation
         story_id = enrichment["story_id"]
         enricher_name = enrichment["enricher_name"]
         enrichment_data = enrichment["enrichment"]
-        
+
         sent_enrichments[story_id][enricher_name] = enrichment_data
-        
+
         logger.info(f"Serving enrichment: {enricher_name} for story {story_id}")
-        
+
         # Return the enrichment
         return Enrichment(
             story_id=story_id,
@@ -199,31 +197,31 @@ async def post_aggregation(aggregation: Aggregation):
     """Receive and validate an aggregation."""
     with data_lock:
         story_id = aggregation.story_id
-        
+
         # Check if story ID is valid
         if story_id not in valid_story_ids:
             logger.warning(f"Invalid story ID: {story_id}")
             raise HTTPException(status_code=400, detail=f"Invalid story ID: {story_id}")
-        
+
         # Check if all enrichments were actually sent for this story
         for enricher_name, enrichment_data in aggregation.enrichments:
             # Check if this enricher was used for this story
             if enricher_name not in sent_enrichments.get(story_id, {}):
                 logger.warning(f"Story {story_id} was not processed by enricher {enricher_name}")
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=400,
                     detail=f"Story {story_id} was not processed by enricher {enricher_name}"
                 )
-            
+
             # Check if the enrichment data matches what was sent
             sent_enrichment = sent_enrichments.get(story_id, {}).get(enricher_name)
             if sent_enrichment != enrichment_data:
                 logger.warning(f"Enrichment data mismatch for story {story_id}, enricher {enricher_name}")
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=400,
                     detail=f"Enrichment data mismatch for story {story_id}, enricher {enricher_name}"
                 )
-        
+
         logger.info(f"Valid aggregation received for story {story_id} with {len(aggregation.enrichments)} enrichments")
         return {"status": "success", "message": "Aggregation accepted"}
 
@@ -235,6 +233,10 @@ async def root():
         "endpoints": {
             "GET /v1/enrichment": "Get the next available enrichment",
             "POST /v1/aggregation": "Submit an aggregation"
+        },
+        "status": {
+            "stories_generated": len(valid_story_ids),
+            "pending_enrichments": len(enrichments_queue)
         }
     }
 
