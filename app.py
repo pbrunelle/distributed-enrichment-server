@@ -23,6 +23,8 @@ STORY_GENERATION_INTERVAL_MS = 1000  # milliseconds
 NUMBER_OF_ENRICHERS = 5
 ENRICHER_TIME_MIN = 0.5  # seconds
 ENRICHER_TIME_MAX = 5.0  # seconds
+CLEANUP_STORIES_AFTER = 25  # seconds
+CLEANUP_ENRICHMENTS_AFTER = 20  # seconds
 
 # Enrichers
 ENRICHERS = [
@@ -50,7 +52,7 @@ class Aggregation(BaseModel):
 # Using a priority queue (heap) to ensure we get the next available enrichment by time
 enrichments_queue = []  # Will be used as a heap
 sent_enrichments = defaultdict(dict)  # story_id -> {enricher_name: enrichment}
-valid_story_ids = set()
+valid_story_ids: dict[str, int] = dict()  # story id -> creation time
 n_generated_stories = 0
 n_generated_enrichments = 0
 n_get_enrichment_200 = 0
@@ -62,6 +64,32 @@ n_aggregation_400_enrichments = 0
 
 # Lock for thread safety
 data_lock = threading.Lock()
+
+def clean_story_ids():
+    global valid_story_ids
+    global sent_enrichments
+    now = time.time()
+    with data_lock:
+        to_delete = [
+            story_id
+            for story_id, creation_time in valid_story_ids.items()
+            if (now - creation_time) > CLEANUP_STORIES_AFTER
+        ]
+        for suid in to_delete:
+            del valid_story_ids[suid]
+            if suid in sent_enrichments:
+                del sent_enrichments[suid]
+
+def clean_story_enrichments():
+    global enrichments_queue
+    now = time.time()
+    with data_lock:
+        enrichments_queue = [
+            item
+            for item in enrichments_queue
+            if (now - item[0]) < CLEANUP_ENRICHMENTS_AFTER
+        ]
+        heapq.heapify(enrichments_queue)
 
 def generate_story_id() -> str:
     """Generate a random 12-character story ID."""
@@ -157,12 +185,17 @@ def story_generator():
         # Generate a new story
         story_id = generate_story_id()
         with data_lock:
-            valid_story_ids.add(story_id)
+            valid_story_ids[story_id] = time.time()
         n_generated_stories += 1
         logger.info(f"Generated new story: {story_id}")
 
         # Generate enrichments for this story - these will be interleaved with other stories
         generate_story_enrichments(story_id)
+
+        # Do a bit of clean up to make sure data structures don't grow too much
+        # if the server has been running for days
+        clean_story_ids()
+        clean_story_enrichments()
 
         # Wait for next story generation
         time.sleep(STORY_GENERATION_INTERVAL_MS / 1000)
